@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Walkie-Talkie Room</title>
+<script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; min-height: 100vh; padding: 20px; font-family: system-ui, sans-serif;
+    background: #1d1f24; color: #eee; display: flex; flex-direction: column; align-items: center; gap: 14px;
+  }
+  h1 { font-size: 1.2rem; letter-spacing: .12em; margin: 0; text-transform: uppercase; }
+  #state { color: #9ab; text-align: center; min-height: 1.3em; }
+  .box { width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 8px; }
+  input {
+    font: inherit; padding: .6rem; border-radius: 6px; border: 1px solid #333; background: #111316; color: #eee;
+  }
+  .row { display: flex; gap: 8px; }
+  .row input { flex: 1; }
+  button {
+    font: inherit; padding: .55rem .9rem; border: none; border-radius: 6px;
+    background: #3b82f6; color: #fff; cursor: pointer;
+  }
+  button.secondary { background: #374151; }
+  #ptt {
+    width: 200px; height: 200px; margin: 8px 0; border: none; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #f06a50, #8c2a1d);
+    color: #fff; font: bold 1.05rem system-ui, sans-serif; letter-spacing: .08em;
+    box-shadow: 0 10px 24px #0009; cursor: pointer; user-select: none; touch-action: none;
+    transition: transform .08s, background .2s;
+  }
+  #ptt.on { transform: scale(.96); background: radial-gradient(circle at 35% 30%, #6ee7a0, #166534); }
+  #peers, #talk { text-align: center; min-height: 1.2em; }
+  #talk { color: #fbbf24; }
+  #log { font-size: .8rem; color: #aaa; max-height: 160px; overflow-y: auto; }
+  #log div { padding: 2px 0; border-bottom: 1px solid #2a2d33; }
+</style>
+</head>
+<body>
+  <h1>Walkie-Talkie</h1>
+  <div id="state">Enter a room name to join</div>
+
+  <div class="box" id="joinBox">
+    <div class="row">
+      <input id="room" placeholder="Room name (pick something unique)" autocomplete="off">
+      <button id="joinBtn">Join</button>
+    </div>
+  </div>
+
+  <section id="radio" style="display:flex;flex-direction:column;align-items:center;gap:8px" hidden>
+    <button id="ptt">HOLD TO TALK</button>
+    <div id="talk"></div>
+    <div id="peers"></div>
+    <button id="leaveBtn" class="secondary">Leave room</button>
+  </section>
+
+  <div id="remotes"></div>
+  <div id="log" class="box"></div>
+
+<script>
+  // Room = a shared public MQTT topic used only for the handshake (offers/answers).
+  // Audio flows directly device-to-device over WebRTC. The broker never sees audio.
+  const BROKER = 'wss://broker.hivemq.com:8884/mqtt';
+  const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  const myId = Math.random().toString(36).slice(2, 6).toUpperCase();
+
+  const links = new Map();      // peerId -> { pc, dc, open, audio }
+  const connecting = new Set(); // peers we are in the middle of connecting to
+  const talkers = new Set();
+  let client = null, topic = null, mic = null, audioCtx = null, talking = false;
+
+  const $ = id => document.getElementById(id);
+  const log = t => { const d = document.createElement('div'); d.textContent = new Date().toLocaleTimeString() + '  ' + t; $('log').prepend(d); };
+  const setState = t => { $('state').textContent = t; };
+  const rid = () => Math.random().toString(36).slice(2, 10);
+
+  async function ensureAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+  }
+
+  function beep(freq, dur = 0.1) {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  }
+
+  async function getMic() {
+    if (!mic) {
+      mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      mic.getAudioTracks()[0].enabled = false;
+    }
+  }
+
+  // Hash the room name so the broker topic is not the readable name
+  async function roomTopic(name) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('walkie:' + name.trim().toLowerCase()));
+    return 'walkie/v1/' + [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function publish(msg) {
+    if (client && client.connected) client.publish(topic, JSON.stringify({ ...msg, from: myId }));
+  }
+
+  function waitForIce(pc) {
+    return new Promise(resolve => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
+      pc.addEventListener('icegatheringstatechange', check);
+      setTimeout(resolve, 6000);
+    });
+  }
+
+  function makeLink(peer) {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    pc.addTrack(mic.getAudioTracks()[0], mic);
+    const audio = document.createElement('audio');
+    audio.autoplay = true;
+    $('remotes').appendChild(audio);
+    const link = { pc, dc: null, open: false, audio };
+    pc.ontrack = e => { audio.srcObject = e.streams[0] || new MediaStream([e.track]); audio.play().catch(() => {}); };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') connecting.delete(peer);
+      if (['failed', 'closed'].includes(pc.connectionState)) dropPeer(peer);
+    };
+    links.set(peer, link);
+    return link;
+  }
+
+  function wireChannel(peer, dc) {
+    const link = links.get(peer);
+    link.dc = dc;
+    dc.onopen = () => { link.open = true; log('Connected to ' + peer); refreshUI(); };
+    dc.onclose = () => dropPeer(peer);
+    dc.onmessage = e => onTalkSignal(JSON.parse(e.data));
+  }
+
+  function dropPeer(peer) {
+    const link = links.get(peer);
+    if (!link) return;
+    if (link.dc) link.dc.close();
+    link.pc.close();
+    link.audio.remove();
+    links.delete(peer);
+    connecting.delete(peer);
+    talkers.delete(peer);
+    log('Left: ' + peer);
+    refreshUI();
+  }
+
+  // ---- Room signaling ----
+  function onSignal(m) {
+    if (m.from === myId) return; // our own message echoed back
+    if (m.type === 'hello') {
+      if (links.has(m.from) || connecting.has(m.from)) return;
+      // Lower id always makes the offer, so two devices never offer to each other at once
+      if (myId < m.from) startOffer(m.from);
+      else if (!m.reply) publish({ type: 'hello', reply: true });
+    } else if (m.type === 'offer' && m.to === myId) {
+      answerOffer(m);
+    } else if (m.type === 'answer' && m.to === myId) {
+      const link = links.get(m.from);
+      if (link && link.pc.signalingState === 'have-local-offer') link.pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+    } else if (m.type === 'bye') {
+      dropPeer(m.from);
+    }
+  }
+
+  async function startOffer(peer) {
+    connecting.add(peer);
+    try {
+      const link = makeLink(peer);
+      wireChannel(peer, link.pc.createDataChannel('walkie'));
+      await link.pc.setLocalDescription(await link.pc.createOffer());
+      await waitForIce(link.pc);
+      publish({ type: 'offer', to: peer, sdp: link.pc.localDescription.sdp });
+    } catch (e) { connecting.delete(peer); log('Offer failed: ' + e.message); }
+  }
+
+  async function answerOffer(m) {
+    if (links.has(m.from)) return;
+    connecting.add(m.from);
+    try {
+      const link = makeLink(m.from);
+      link.pc.ondatachannel = e => wireChannel(m.from, e.channel);
+      await link.pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+      await link.pc.setLocalDescription(await link.pc.createAnswer());
+      await waitForIce(link.pc);
+      publish({ type: 'answer', to: m.from, sdp: link.pc.localDescription.sdp });
+    } catch (e) { connecting.delete(m.from); log('Answer failed: ' + e.message); }
+  }
+
+  // ---- Join / leave ----
+  async function joinRoom() {
+    const name = $('room').value.trim();
+    if (!name) { setState('Enter a room name first'); return; }
+    try {
+      await ensureAudio();
+      await getMic();
+    } catch (e) { setState('Microphone unavailable: ' + e.message); return; }
+
+    topic = await roomTopic(name);
+    client = mqtt.connect(BROKER, { clientId: 'walkie-' + myId + '-' + rid(), reconnectPeriod: 3000 });
+    client.on('connect', () => {
+      client.subscribe(topic);
+      publish({ type: 'hello' });
+      setState('In room "' + name + '" as ' + myId);
+      $('joinBox').hidden = true;
+      $('radio').hidden = false;
+      log('Joined room');
+    });
+    client.on('message', (t, payload) => {
+      try { onSignal(JSON.parse(payload.toString())); } catch (e) { /* ignore malformed */ }
+    });
+    client.on('error', e => log('Broker error: ' + e.message));
+  }
+
+  function leaveRoom() {
+    publish({ type: 'bye' });
+    for (const peer of [...links.keys()]) dropPeer(peer);
+    if (client) client.end(true);
+    client = null; topic = null; talking = false;
+    $('joinBox').hidden = false;
+    $('radio').hidden = true;
+    setState('Enter a room name to join');
+    refreshUI();
+  }
+
+  function refreshUI() {
+    const open = [...links].filter(([, l]) => l.open).map(([p]) => p);
+    $('peers').textContent = open.length ? 'Connected: ' + open.join(', ') : 'Waiting for others to join…';
+  }
+
+  // ---- Talk ----
+  function broadcastTalk(msg) {
+    const data = JSON.stringify(msg);
+    for (const l of links.values()) if (l.open) l.dc.send(data);
+  }
+
+  function onTalkSignal(m) {
+    if (m.type === 'start') { talkers.add(m.from); beep(660, 0.08); }
+    if (m.type === 'end') { talkers.delete(m.from); beep(440, 0.1); }
+    $('talk').textContent = talkers.size ? 'Talking: ' + [...talkers].join(', ') : '';
+  }
+
+  function pttDown(e) {
+    e.preventDefault();
+    if (talking || ![...links.values()].some(l => l.open)) return;
+    talking = true;
+    mic.getAudioTracks()[0].enabled = true;
+    broadcastTalk({ type: 'start', from: myId });
+    $('ptt').classList.add('on');
+    $('ptt').textContent = 'TRANSMITTING';
+    beep(880, 0.12);
+  }
+
+  function pttUp(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!talking) return;
+    talking = false;
+    mic.getAudioTracks()[0].enabled = false;
+    broadcastTalk({ type: 'end', from: myId });
+    $('ptt').classList.remove('on');
+    $('ptt').textContent = 'HOLD TO TALK';
+    beep(440, 0.1);
+  }
+
+  $('joinBtn').onclick = joinRoom;
+  $('room').addEventListener('keydown', e => { if (e.key === 'Enter') joinRoom(); });
+  $('leaveBtn').onclick = leaveRoom;
+  window.addEventListener('pagehide', () => { if (client) publish({ type: 'bye' }); });
+
+  const ptt = $('ptt');
+  ptt.addEventListener('pointerdown', pttDown);
+  ptt.addEventListener('pointerup', pttUp);
+  ptt.addEventListener('pointercancel', pttUp);
+  window.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && !$('radio').hidden && e.target.tagName !== 'INPUT') pttDown(e); });
+  window.addEventListener('keyup', e => { if (e.code === 'Space') pttUp(e); });
+</script>
+</body>
+</html>
